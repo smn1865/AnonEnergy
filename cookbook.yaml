@@ -1,0 +1,180 @@
+# Cookbook for the electricity-billing anonymizer.
+# Rules only: no secrets and no data. The hash key lives outside this file (roadmap step 6).
+version: 2
+
+source:
+  schema: public
+  table: bills
+
+parameters:
+  min_group_size: 5            # no published group may describe fewer subscribers than this
+  kwh_noise_percent: 5         # each kWh value is first moved by a random amount of up to +/- 5% (0 = no noise)
+  kwh_round_to: 10             # day and night kWh are rounded to the nearest 10
+  kwh_cap_percentile: 99       # household consumption is capped at this percentile
+  kwh_cap_applies_to: [resident]   # which consumer types count as households for the cap
+  kwh_lowest_bin: 50           # a bill of this many kWh or fewer (day + night) is published as this total, so 0 does not show
+  dominance_limit: 0.5         # no single member may hold more than this share of a group's kWh
+  hash_hex_chars: 16           # length of a keyed hash in the output (16 hex characters = 64 bits)
+
+# What to do when the source table does not look exactly like this cookbook.
+on_unknown_column: drop_and_report   # a source column not named below never reaches the output
+on_missing_column: fail              # a column named below but absent from the source stops the run
+
+location_cleaning:
+  levels: [region, community, settlement]   # widest to narrowest
+  strip_prefixes: ["ք.", "գ."]              # "ք. Գյումրի" and "Գյումրի" are the same place
+  unknown_label: unknown                     # blank locations get this value instead of being dropped
+
+# Step 4: how small groups are protected.
+small_groups:
+  labels:                                # {parent} is the community or region the bucket belongs to
+    settlement: {other: "Other settlements, {parent}", whole: "{parent} (all settlements)"}
+    community:  {other: "Other communities, {parent}", whole: "{parent} (all communities)"}
+    region:     {other: "Other regions", whole: "All regions"}
+    not_shown: Not shown
+  combination_check:
+    columns: [consumer_type, voltage_kv]   # place + these must describe at least min_group_size people
+    merge_first:                           # tried before the place is shown less precisely
+      consumer_type: {legal_entity: business, sole_proprietor: business}
+      voltage_kv: {"6(10)": above 0.38, "35": above 0.38}
+    follow:                                # when voltage is merged, the tariff must not give it away
+      voltage_kv:
+        tariff_category: {other_6_10kv: other_above_0.38kv, other_35kv: other_above_0.38kv}
+  also_protect: [substation_id, contract_decade]   # each is shown only where place + the columns above + the
+                                           # columns before it + itself still describe min_group_size people;
+                                           # otherwise it is blank for those subscribers. The release gate checks all of them together.
+  dominance_action: blank_kwh              # blank_kwh: hide the dominant member's kWh | report_only
+
+# Step 5: the second database. The output table is stored there as ciphertext, in blocks of rows,
+# and read through a view named like the output table.
+second_database:
+  store_table: bills_anonymized_store   # holds only encrypted blocks
+  rows_per_block: 200                   # rows encrypted together; bigger blocks read faster
+  column_types:                         # how the view presents each column; anything not listed is text
+    kwh_day: integer
+    kwh_night: integer
+  researchers:                          # limits on every researcher account (roadmap step 7)
+    account_days: 30                    # an account stops working this many days after it is made or renewed
+    daily_query_limit: 200              # queries one account may run in a day (UTC)
+    query_seconds: 60                   # the longest one query may run
+    connections: 3                      # sessions one account may have open at the same time
+
+# Step 8: the risk report and the audit log.
+# The headline measure is the share of subscribers who sit in a group smaller than min_group_size
+# when grouped by place and by the columns below, counted before and after the run.
+risk_report:
+  measure_columns: [consumer_type, tariff_category]
+  merge_for_measure:                    # the monthly consumption band is the measured value itself, not
+    tariff_category:                    # something known from outside, so the bands count as one tariff group
+      residential_0_200: residential
+      residential_201_400: residential
+      residential_over_400: residential
+      social: residential
+  audit_log: audit_log.jsonl            # one line per run, each line chained to the one before
+  report_file: report.html              # the one-screen report of the latest run
+
+# Which column identifies the person or company behind a card.
+# Used only for counting distinct people in step 4. It is never written to the output.
+person_marker:
+  resident: passport_or_id_no
+  sole_proprietor: passport_or_id_no
+  legal_entity: taxpayer_no
+  fallback: subscriber_card_no
+
+# After every run, the output is searched for raw values from these columns.
+# One hit fails the run. Only identifying text is listed; plain numbers would match by coincidence.
+leak_scan_columns:
+  - subscriber_card_no
+  - first_name
+  - last_name
+  - company_name
+  - passport_or_id_no
+  - taxpayer_no
+  - bank_account_no
+  - phone
+  - email
+  - street
+  - meter_serial_no
+  - notes
+  - bill_id
+
+# One rule per source column, in source order.
+#   listed: true  -> on the team's agreed list of columns to work on
+#   listed: false -> not on the list. After the attack of step 9 these are hashed or deleted too,
+#                    except voltage_kv, which the group check covers.
+columns:
+  bill_id:             {action: keyed_hash, listed: false}   # printed on every bill: unchanged, it would point at the subscriber
+  billing_month:       {action: keep_time, granularity: hour, listed: true}   # finer timestamps are cut to the hour; a month stays a month
+  subscriber_card_no:  {action: keyed_hash, output: subscriber_id, listed: true}   # the join key
+  consumer_type:       {action: keep, listed: true}
+  first_name:          {action: delete, listed: true}
+  last_name:           {action: delete, listed: true}
+  company_name:        {action: delete, listed: true}
+  passport_or_id_no:   {action: delete, listed: true}
+  taxpayer_no:         {action: delete, listed: true}
+  bank_account_no:     {action: delete, listed: true}
+  phone:               {action: delete, listed: true}
+  email:               {action: delete, listed: true}
+  contract_date:       {action: year_only, band_years: 10, output: contract_decade, listed: true}   # 2014 -> "2010-2019"
+  region:              {action: clean_location, listed: true}
+  community:           {action: clean_location, listed: true}
+  settlement:          {action: clean_location, rollup: true, listed: true}   # small settlements are merged in step 4
+  street:              {action: delete, listed: true}
+  building:            {action: delete, listed: true}
+  apartment:           {action: delete, listed: true}
+  substation_id:       {action: keep_if_min_group, otherwise: blank, listed: true}   # blank = generalized; community already gives the district
+  meter_serial_no:     {action: keyed_hash, output: meter_id, listed: true}
+  meter_type:          {action: delete, listed: false}
+  voltage_kv:          {action: keep, listed: false}
+  has_solar:           {action: delete, listed: false}   # unique in three places
+  tariff_category:     {action: merge_values, merge: {social: residential_tier_by_kwh}, listed: true}
+  reading_date:        {action: delete, listed: false}   # billing_month already gives the period
+  reading_prev_day:    {action: delete, listed: true}   # the kWh difference is kept instead (kwh_day)
+  reading_curr_day:    {action: delete, listed: true}
+  reading_prev_night:  {action: delete, listed: true}   # the kWh difference is kept instead (kwh_night)
+  reading_curr_night:  {action: delete, listed: true}
+  kwh_day:             {action: round_and_cap, listed: true}
+  kwh_night:           {action: round_and_cap, listed: true}
+  amount_amd:          {action: delete, listed: true}
+  debt_start_amd:      {action: delete, listed: true}
+  amount_paid_amd:     {action: delete, listed: false}  # almost unique, and it would undo the kWh rounding and cap
+  payment_date:        {action: delete, listed: true}
+  payment_channel:     {action: delete, listed: false}
+  payment_deadline:    {action: delete, listed: true}
+  debt_end_amd:        {action: delete, listed: true}
+  disconnected:        {action: delete, listed: true}
+  notes:               {action: delete, listed: false}  # free text with names, phone numbers and health details
+
+# The only table in the second database.
+output_table:
+  name: bills_anonymized
+  columns:
+    - bill_id
+    - billing_month
+    - subscriber_id
+    - consumer_type
+    - contract_decade
+    - region
+    - community
+    - settlement
+    - substation_id
+    - meter_id
+    - voltage_kv
+    - tariff_category
+    - kwh_day
+    - kwh_night
+  example_row:           # illustrative values, not real output
+    bill_id: 71c0d2a94e6b83f5
+    billing_month: 2026-06
+    subscriber_id: 9f2c41d07ab35e18
+    consumer_type: resident
+    contract_decade: 2010-2019
+    region: Երևան
+    community: Երևան
+    settlement: Կենտրոն
+    substation_id: TP-0112
+    meter_id: 4be07713c95a20fd
+    voltage_kv: "0.38"
+    tariff_category: residential_0_200
+    kwh_day: 100
+    kwh_night: 70
